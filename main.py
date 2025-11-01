@@ -30,6 +30,12 @@ sb = tk.Scrollbar(f)
 sb.pack(side="right", fill="y")
 
 t = tk.Text(f, wrap="word", yscrollcommand=sb.set, state="disabled")
+t.config(state="normal")
+for k, v in settings.items():
+    t.insert("end", f"{k}: {v}\n")
+t.config(state="disabled")
+t.see("end")
+
 t.pack(side="left", fill="both", expand=True)
 sb.config(command=t.yview)
 
@@ -39,7 +45,9 @@ e.pack(fill="x", padx=10, pady=(6, 12))
 def add(_=None):
     s = e.get().strip()
     if s:
+        t.config(state="normal")
         t.insert("end", s + "\n")
+        t.config(state="disabled")
         t.see("end")
         e.delete(0, "end")
     memory.append(s)
