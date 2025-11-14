@@ -1,39 +1,43 @@
 #!/usr/bin/env python3
 """
-maven_graph_cli.py — Этап 3 (пункты 1-3).
-- Итеративный DFS (без рекурсии) для построения транзитивного графа зависимостей.
-- Фильтрация пакетов по подстроке (игнорировать пакеты, имя которых содержит подстроку).
-- Обнаружение циклов и корректная обработка.
-- Режим test: читать граф из файла, где пакеты — большие латинские буквы.
+Этап 4: дополнительные операции над графом зависимостей.
 
-Usage examples:
- python maven_graph_cli.py --package org.example:app --version 1.0.0 --repo https://repo1.maven.org/maven2 --mode remote
- python maven_graph_cli.py --mode test --repo ./test_graph.txt --package A --filter C
- python maven_graph_cli.py --mode local --repo /path/to/local/maven/repo --package org.x:lib -v 2.1.0
+Добавлено:
+- Режим вывода на экран порядка загрузки зависимостей (--show-load-order).
+  Порядок считается по постфиксному обходу DFS (итеративному, без рекурсии):
+  все зависимости узла идут ДО самого узла.
 """
+
 import argparse
-import os
 import sys
 from pathlib import Path
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
-from collections import defaultdict, deque
+from collections import defaultdict
 
 DEFAULT_REPO = "https://repo1.maven.org/maven2"
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Этап 3: построение графа зависимостей (итеративный DFS, фильтрация, обработка циклов)")
-    p.add_argument("-p", "--package", required=True, help="GroupId:ArtifactId (или 'A' в режиме test)")
-    p.add_argument("-r", "--repo", default=DEFAULT_REPO, help="URL репозитория / локальный путь / файл описания тестового репозитория")
-    p.add_argument("-m", "--mode", choices=["remote", "local", "test"], default="remote", help="Режим: remote, local, test")
-    p.add_argument("-v", "--version", default="", help="Версия пакета (необязательно для test режима)")
-    p.add_argument("-f", "--filter", default=None, help="Подстрока для исключения пакетов из анализа (case-insensitive)")
+    p = argparse.ArgumentParser(
+        description="Этап 3+4: граф зависимостей (DFS без рекурсии, циклы, фильтр, порядок загрузки)"
+    )
+    p.add_argument("-p", "--package", required=True,
+                   help="GroupId:ArtifactId (или 'A' в режиме test)")
+    p.add_argument("-r", "--repo", default=DEFAULT_REPO,
+                   help="URL репозитория / локальный путь / файл тестового репо")
+    p.add_argument("-m", "--mode", choices=["remote", "local", "test"], default="remote",
+                   help="Режим: remote, local, test")
+    p.add_argument("-v", "--version", default="",
+                   help="Версия пакета (игнорируется в режиме test)")
+    p.add_argument("-f", "--filter", default=None,
+                   help="Подстрока для исключения пакетов из анализа (case-insensitive)")
+    p.add_argument("--show-load-order", action="store_true",
+                   help="Показать порядок загрузки зависимостей (постфиксный DFS)")
     return p.parse_args()
 
-# -----------------------------
-# 1) Утилиты для получения direct deps
-# -----------------------------
+# ---------- POM utilities (remote/local) ----------
+
 def build_pom_path(group_id: str, artifact_id: str, version: str, repo: str, mode: str):
     if mode == "remote":
         group_path = group_id.replace(".", "/")
@@ -50,7 +54,7 @@ def fetch_pom_remote(url: str, timeout=15):
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             if resp.status != 200:
                 raise urllib.error.HTTPError(url, resp.status, resp.reason, resp.headers, None)
-            return resp.read().decode('utf-8')
+            return resp.read().decode("utf-8")
     except Exception as e:
         raise RuntimeError(f"Ошибка загрузки POM: {e} ({url})")
 
@@ -75,6 +79,7 @@ def parse_pom_direct_deps(pom_xml: str):
     deps_node = root.find(f"./{ns_prefix}dependencies")
     if deps_node is None:
         return deps
+
     for dep in deps_node.findall(f"./{ns_prefix}dependency"):
         gid = dep.find(f"./{ns_prefix}groupId")
         aid = dep.find(f"./{ns_prefix}artifactId")
@@ -82,19 +87,13 @@ def parse_pom_direct_deps(pom_xml: str):
         gid_text = gid.text.strip() if gid is not None and gid.text else None
         aid_text = aid.text.strip() if aid is not None and aid.text else None
         ver_text = ver.text.strip() if ver is not None and ver.text else None
-        # normalize coordinate: group:artifact:version (version may be None)
         if gid_text and aid_text:
             coord = f"{gid_text}:{aid_text}" + (f":{ver_text}" if ver_text else "")
             deps.append(coord)
     return deps
 
-# -----------------------------
-# 2) Тестовый режим — файл формата:
-# A: B C
-# B: C D
-# C:
-# (пакеты — одиночные большие латинские буквы)
-# -----------------------------
+# ---------- test-repo (A,B,C...) ----------
+
 def load_test_repo(path: str):
     mapping = {}
     p = Path(path)
@@ -110,62 +109,61 @@ def load_test_repo(path: str):
             deps = [x.strip() for x in right.split() if x.strip()]
             mapping[key] = deps
         else:
-            # строка без ":" — считаем, что нет зависимостей
             key = line.strip()
             mapping[key] = []
     return mapping
 
-# -----------------------------
-# 3) Итеративный DFS (без рекурсии), построение транзитивного графа, фильтрация, детекция циклов
-# -----------------------------
-def build_transitive_graph(start_coord: str, mode: str, repo: str, version: str, filter_substr: str):
-    # graph: adjacency list (node -> set(neighbors))
-    graph = defaultdict(set)
-    visited = set()    # полностью обработанные узлы
-    in_stack = set()   # вершины в текущем пути (для обнаружения цикла)
-    cycles = []        # список циклов (как списки узлов)
-    stack = []         # основной стек для DFS: каждый элемент (node, iterator_over_neighbors)
+# ---------- core: iterative DFS + load order ----------
 
-    def should_skip(node_name: str):
+def build_transitive_graph(start_coord: str, mode: str, repo: str,
+                           version: str, filter_substr: str):
+    """
+    Возвращает:
+      graph: dict(node -> set(neighbors))
+      visited: set(all processed nodes)
+      cycles: list of cycles (each is list of nodes)
+      load_order: list of nodes в порядке загрузки (dependencies-before-dependents)
+    """
+    graph = defaultdict(set)
+    visited = set()
+    in_stack = set()
+    cycles = []
+    load_order = []  # сюда пишем узел, когда он полностью обработан (post-order)
+
+    test_repo_map = {}
+    if mode == "test":
+        test_repo_map = load_test_repo(repo)
+
+    def should_skip(name: str) -> bool:
         if not filter_substr:
             return False
-        return filter_substr.lower() in node_name.lower()
+        return filter_substr.lower() in name.lower()
 
-    # helper to get direct deps for a coordinate
-    def get_direct_deps(coord):
+    def get_direct_deps(coord: str):
         if mode == "test":
-            # here coord is single letter like 'A'
             return test_repo_map.get(coord, [])
-        # otherwise coord is group:artifact[:version]
         if ":" not in coord:
             return []
         parts = coord.split(":")
         group_id = parts[0]
         artifact_id = parts[1]
-        # prefer explicit version, else use provided outer 'version'
         ver = parts[2] if len(parts) >= 3 and parts[2] else version
-        pom_path = build_pom_path(group_id, artifact_id, ver, repo, 'remote' if mode == 'remote' else 'local')
+        pom_path = build_pom_path(group_id, artifact_id, ver, repo,
+                                  "remote" if mode == "remote" else "local")
         try:
             pom_xml = fetch_pom_remote(pom_path) if mode == "remote" else fetch_pom_local(pom_path)
-            deps = parse_pom_direct_deps(pom_xml)
-            return deps
+            return parse_pom_direct_deps(pom_xml)
         except Exception as e:
-            # в минимальном прототипе: лог и возврат пустого списка (не прерываем весь процесс)
             print(f"Warning: cannot fetch/parse POM for {coord}: {e}", file=sys.stderr)
             return []
 
-    # prepare test repo map if needed
-    test_repo_map = {}
-    if mode == "test":
-        test_repo_map = load_test_repo(repo)
-
-    # стартовый узел
     start = start_coord.strip()
     if should_skip(start):
-        print(f"Start node '{start}' совпадает с фильтрующей подстрокой — ничего не делаем.")
-        return graph, set(), cycles
+        print(f"Start node '{start}' совпадает с фильтром — обход не выполняется.")
+        return graph, visited, cycles, load_order
 
-    # push start
+    # стек: (node, iterator_over_neighbors)
+    stack = []
     stack.append((start, iter(get_direct_deps(start))))
     in_stack.add(start)
 
@@ -173,67 +171,63 @@ def build_transitive_graph(start_coord: str, mode: str, repo: str, version: str,
         node, nbr_iter = stack[-1]
         try:
             nbr = next(nbr_iter)
+
             if should_skip(nbr):
-                # игнорируем зависимость целиком
-                # но сохраняем ребро для полноты графа — помечаем как пропущенное (не добавляем в обход)
                 graph[node].add(nbr + " (skipped)")
                 continue
-            # добавляем ребро
+
             graph[node].add(nbr)
+
             if nbr in in_stack:
-                # найден цикл — выгребаем цикл-путь из stack
-                cycle = []
-                # собрать путь от первой встречи nbr до конца стека
-                for n, _ in stack:
-                    cycle.append(n)
-                    if n == nbr:
-                        break
-                # цикл — nbr ... current node ... nbr (закрытый), лучше вывести корректную последовательность
-                # делаем цикл корректной ориентации:
-                idx = [n for n, _ in stack].index(nbr)
-                cycle_path = [n for n, _ in stack][idx:] + [nbr]
+                # цикл
+                path_nodes = [n for (n, _) in stack]
+                idx = path_nodes.index(nbr)
+                cycle_path = path_nodes[idx:] + [nbr]
                 cycles.append(cycle_path)
-                # не входим повторно в уже в стеке узел
                 continue
+
             if nbr in visited:
-                # уже полностью обработано — просто добавляем ребро
                 continue
-            # иначе — спускаемся дальше: push neighbor
+
             in_stack.add(nbr)
             stack.append((nbr, iter(get_direct_deps(nbr))))
+
         except StopIteration:
-            # все соседи обработаны — пометим node как завершённый
+            # соседи закончились -> узел полностью обработан
             stack.pop()
             in_stack.discard(node)
-            visited.add(node)
-    return graph, visited, cycles
+            if node not in visited:
+                visited.add(node)
+                load_order.append(node)  # post-order: dependencies уже в load_order раньше
 
-# -----------------------------
-# 4) CLI main
-# -----------------------------
+    return graph, visited, cycles, load_order
+
+# ---------- CLI main ----------
+
 def main():
     args = parse_args()
+
     settings = {
         "package": args.package,
         "repo": args.repo,
         "mode": args.mode,
         "version": args.version,
-        "filter": args.filter
+        "filter": args.filter,
+        "show_load_order": args.show_load_order,
     }
     print("Параметры:")
     for k, v in settings.items():
         print(f"{k}: {v}")
     print("-" * 40)
 
-    # Валидация простая:
     if args.mode != "test" and ":" not in args.package:
-        print("Ошибка: для режимов remote/local параметр --package должен быть groupId:artifactId", file=sys.stderr)
+        print("Ошибка: для remote/local --package должен быть groupId:artifactId", file=sys.stderr)
         sys.exit(2)
-    if args.mode == "test" and args.version:
-        print("Notice: версия игнорируется в test режиме.", file=sys.stderr)
 
     try:
-        graph, visited, cycles = build_transitive_graph(args.package, args.mode, args.repo, args.version, args.filter)
+        graph, visited, cycles, load_order = build_transitive_graph(
+            args.package, args.mode, args.repo, args.version, args.filter
+        )
     except FileNotFoundError as e:
         print(f"Ошибка: {e}", file=sys.stderr)
         sys.exit(3)
@@ -241,7 +235,7 @@ def main():
         print(f"Непредвиденная ошибка: {e}", file=sys.stderr)
         sys.exit(10)
 
-    print("Результат (транзитивный граф):")
+    print("Граф зависимостей (рёбра):")
     if not graph:
         print("(пустой граф)")
     else:
@@ -249,19 +243,31 @@ def main():
             for t in targets:
                 print(f"{src} -> {t}")
     print("-" * 20)
-    print("Посещённые узлы (транзитивно):")
+
+    print("Посещённые узлы:")
     if visited:
         for v in sorted(visited):
             print(v)
     else:
         print("(нет посещённых узлов)")
     print("-" * 20)
+
     if cycles:
         print("Обнаруженные циклы:")
         for c in cycles:
             print(" -> ".join(c))
     else:
         print("Циклов не обнаружено.")
+    print("-" * 20)
+
+    if args.show_load_order:
+        print("Порядок загрузки (dependencies-before-dependents):")
+        if not load_order:
+            print("(пусто)")
+        else:
+            # load_order сейчас: [dep1, dep2, ..., root] — уже в нужном порядке
+            for n in load_order:
+                print(n)
 
 if __name__ == "__main__":
     main()
