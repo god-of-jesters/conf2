@@ -1,357 +1,202 @@
-#!/usr/bin/env python3
-"""
-Этап 4: дополнительные операции над графом зависимостей.
-
-Добавлено:
-- Режим вывода на экран порядка загрузки зависимостей (--show-load-order).
-  Порядок считается по постфиксному обходу DFS (итеративному, без рекурсии):
-  все зависимости узла идут ДО самого узла.
-"""
-
 import argparse
 import sys
+import os
 from pathlib import Path
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-
-DEFAULT_REPO = "https://repo1.maven.org/maven2"
+import tkinter as tk
+import math
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="Этап 3+4: граф зависимостей (DFS без рекурсии, циклы, фильтр, порядок загрузки)"
-    )
-    p.add_argument("-p", "--package", required=True,
-                   help="GroupId:ArtifactId (или 'A' в режиме test)")
-    p.add_argument("-r", "--repo", default=DEFAULT_REPO,
-                   help="URL репозитория / локальный путь / файл тестового репо")
-    p.add_argument("-m", "--mode", choices=["remote", "local", "test"], default="remote",
-                   help="Режим: remote, local, test")
-    p.add_argument("-v", "--version", default="",
-                   help="Версия пакета (игнорируется в режиме test)")
-    p.add_argument("-f", "--filter", default=None,
-                   help="Подстрока для исключения пакетов из анализа (case-insensitive)")
-    p.add_argument("--show-load-order", action="store_true",
-                   help="Показать порядок загрузки зависимостей (постфиксный DFS)")
-    p.add_argument("--d2", action="store_true",
-               help="Вывести текстовое описание графа в формате D2")
+    p = argparse.ArgumentParser()
+    p.add_argument("-p", "--package", required=True)
+    p.add_argument("-r", "--repo", default="https://repo1.maven.org/maven2")
+    p.add_argument("-m", "--mode", choices=["remote", "local", "test"], default="remote")
+    p.add_argument("-v", "--version", default="")
+    p.add_argument("-f", "--filter", default=None)
+    p.add_argument("--show-load-order", action="store_true")
+    p.add_argument("--d2", action="true", nargs="?")
     return p.parse_args()
 
-# ---------- POM utilities (remote/local) ----------
-
-def build_pom_path(group_id: str, artifact_id: str, version: str, repo: str, mode: str):
+def build_pom_path(group_id, artifact_id, version, repo, mode):
     if mode == "remote":
         group_path = group_id.replace(".", "/")
         repo = repo.rstrip("/")
-        filename = f"{artifact_id}-{version}.pom"
-        return f"{repo}/{group_path}/{artifact_id}/{version}/{filename}"
-    else:
-        group_path = group_id.replace(".", "/")
-        local_path = Path(repo) / group_path / artifact_id / version / f"{artifact_id}-{version}.pom"
-        return str(local_path)
+        return f"{repo}/{group_path}/{artifact_id}/{version}/{artifact_id}-{version}.pom"
+    group_path = group_id.replace(".", "/")
+    return str(Path(repo) / group_path / artifact_id / version / f"{artifact_id}-{version}.pom")
 
-def fetch_pom_remote(url: str, timeout=15):
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            if resp.status != 200:
-                raise urllib.error.HTTPError(url, resp.status, resp.reason, resp.headers, None)
-            return resp.read().decode("utf-8")
-    except Exception as e:
-        raise RuntimeError(f"Ошибка загрузки POM: {e} ({url})")
+def fetch_pom_remote(url, timeout=15):
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status}")
+        return resp.read().decode("utf-8")
 
-def fetch_pom_local(path: str):
+def fetch_pom_local(path):
     p = Path(path)
-    if not p.exists() or not p.is_file():
-        raise FileNotFoundError(f"POM не найден: {path}")
+    if not p.exists():
+        raise FileNotFoundError(str(path))
     return p.read_text(encoding="utf-8")
 
-def parse_pom_direct_deps(pom_xml: str):
-    try:
-        root = ET.fromstring(pom_xml)
-    except ET.ParseError as e:
-        raise RuntimeError(f"XML parse error: {e}")
-
+def parse_pom_direct_deps(pom_xml):
+    root = ET.fromstring(pom_xml)
     ns_prefix = ""
     if root.tag.startswith("{"):
         ns = root.tag.split("}")[0].strip("{")
         ns_prefix = f"{{{ns}}}"
-
     deps = []
-    deps_node = root.find(f"./{ns_prefix}dependencies")
-    if deps_node is None:
+    dn = root.find(f"./{ns_prefix}dependencies")
+    if dn is None:
         return deps
-
-    for dep in deps_node.findall(f"./{ns_prefix}dependency"):
-        gid = dep.find(f"./{ns_prefix}groupId")
-        aid = dep.find(f"./{ns_prefix}artifactId")
-        ver = dep.find(f"./{ns_prefix}version")
-        gid_text = gid.text.strip() if gid is not None and gid.text else None
-        aid_text = aid.text.strip() if aid is not None and aid.text else None
-        ver_text = ver.text.strip() if ver is not None and ver.text else None
-        if gid_text and aid_text:
-            coord = f"{gid_text}:{aid_text}" + (f":{ver_text}" if ver_text else "")
-            deps.append(coord)
+    for d in dn.findall(f"./{ns_prefix}dependency"):
+        gid = d.find(f"./{ns_prefix}groupId")
+        aid = d.find(f"./{ns_prefix}artifactId")
+        ver = d.find(f"./{ns_prefix}version")
+        if gid is not None and aid is not None:
+            g = gid.text.strip()
+            a = aid.text.strip()
+            v = ver.text.strip() if ver is not None and ver.text else ""
+            if g and a:
+                deps.append(f"{g}:{a}" + (f":{v}" if v else ""))
     return deps
 
-# ---------- test-repo (A,B,C...) ----------
-
-def load_test_repo(path: str):
-    mapping = {}
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Test repo file not found: {path}")
-    for raw in p.read_text(encoding="utf-8").splitlines():
+def load_test_repo(path):
+    out = {}
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         if ":" in line:
             left, right = line.split(":", 1)
-            key = left.strip()
-            deps = [x.strip() for x in right.split() if x.strip()]
-            mapping[key] = deps
+            out[left.strip()] = [x.strip() for x in right.split() if x.strip()]
         else:
-            key = line.strip()
-            mapping[key] = []
-    return mapping
+            out[line.strip()] = []
+    return out
 
-# ---------- core: iterative DFS + load order ----------
-
-def build_transitive_graph(start_coord: str, mode: str, repo: str,
-                           version: str, filter_substr: str):
-    """
-    Возвращает:
-      graph: dict(node -> set(neighbors))
-      visited: set(all processed nodes)
-      cycles: list of cycles (each is list of nodes)
-      load_order: list of nodes в порядке загрузки (dependencies-before-dependents)
-    """
+def build_transitive_graph(start, mode, repo, version, filter_substr):
     graph = defaultdict(set)
     visited = set()
     in_stack = set()
     cycles = []
-    load_order = []  # сюда пишем узел, когда он полностью обработан (post-order)
+    load_order = []
+    test_repo_map = load_test_repo(repo) if mode == "test" else {}
 
-    test_repo_map = {}
-    if mode == "test":
-        test_repo_map = load_test_repo(repo)
+    def need_skip(n):
+        return filter_substr and filter_substr.lower() in n.lower()
 
-    def should_skip(name: str) -> bool:
-        if not filter_substr:
-            return False
-        return filter_substr.lower() in name.lower()
-
-    def get_direct_deps(coord: str):
+    def deps_of(coord):
         if mode == "test":
             return test_repo_map.get(coord, [])
         if ":" not in coord:
             return []
-        parts = coord.split(":")
-        group_id = parts[0]
-        artifact_id = parts[1]
-        ver = parts[2] if len(parts) >= 3 and parts[2] else version
-        pom_path = build_pom_path(group_id, artifact_id, ver, repo,
-                                  "remote" if mode == "remote" else "local")
+        p = coord.split(":")
+        g, a = p[0], p[1]
+        v = p[2] if len(p) >= 3 and p[2] else version
+        pom = build_pom_path(g, a, v, repo, "remote" if mode == "remote" else "local")
         try:
-            pom_xml = fetch_pom_remote(pom_path) if mode == "remote" else fetch_pom_local(pom_path)
-            return parse_pom_direct_deps(pom_xml)
-        except Exception as e:
-            print(f"Warning: cannot fetch/parse POM for {coord}: {e}", file=sys.stderr)
+            xml = fetch_pom_remote(pom) if mode == "remote" else fetch_pom_local(pom)
+            return parse_pom_direct_deps(xml)
+        except:
             return []
 
-    start = start_coord.strip()
-    if should_skip(start):
-        print(f"Start node '{start}' совпадает с фильтром — обход не выполняется.")
+    if need_skip(start):
         return graph, visited, cycles, load_order
 
-    # стек: (node, iterator_over_neighbors)
-    stack = []
-    stack.append((start, iter(get_direct_deps(start))))
+    st = [(start, iter(deps_of(start)))]
     in_stack.add(start)
 
-    while stack:
-        node, nbr_iter = stack[-1]
+    while st:
+        node, it = st[-1]
         try:
-            nbr = next(nbr_iter)
-
-            if should_skip(nbr):
-                graph[node].add(nbr + " (skipped)")
+            n = next(it)
+            graph[node].add(n)
+            if need_skip(n):
                 continue
-
-            graph[node].add(nbr)
-
-            if nbr in in_stack:
-                # цикл
-                path_nodes = [n for (n, _) in stack]
-                idx = path_nodes.index(nbr)
-                cycle_path = path_nodes[idx:] + [nbr]
-                cycles.append(cycle_path)
+            if n in in_stack:
+                path = [x for x, _ in st]
+                i = path.index(n)
+                cycles.append(path[i:] + [n])
                 continue
-
-            if nbr in visited:
+            if n in visited:
                 continue
-
-            in_stack.add(nbr)
-            stack.append((nbr, iter(get_direct_deps(nbr))))
-
+            in_stack.add(n)
+            st.append((n, iter(deps_of(n))))
         except StopIteration:
-            # соседи закончились -> узел полностью обработан
-            stack.pop()
+            st.pop()
             in_stack.discard(node)
             if node not in visited:
                 visited.add(node)
-                load_order.append(node)  # post-order: dependencies уже в load_order раньше
-
+                load_order.append(node)
     return graph, visited, cycles, load_order
 
-def graph_to_d2(graph: dict) -> str:
-    """
-    Преобразует graph (node -> set(neighbors)) в текст D2.
-    """
+def graph_to_d2(graph):
     lines = []
-    lines.append("# D2 diagram for dependency graph")
-    lines.append("direction: right")  # можно убрать, это просто пример
-
-    # Собираем все узлы (на всякий случай)
+    lines.append("direction: right")
     nodes = set(graph.keys())
-    for targets in graph.values():
-        for t in targets:
-            nodes.add(t)
-
-    # Явно объявим узлы (не обязательно, но аккуратнее)
+    for t in graph.values():
+        for x in t:
+            nodes.add(x)
     for n in sorted(nodes):
-        # Чистим суффикс (skipped) если используешь его
-        base = n.replace(" (skipped)", "")
-        lines.append(f'{base}: {{ label: "{base}" }}')
-
-    # Рёбра
-    for src, targets in graph.items():
-        src_clean = src.replace(" (skipped)", "")
-        for t in targets:
-            tgt_clean = t.replace(" (skipped)", "")
-            lines.append(f"{src_clean} -> {tgt_clean}")
-
+        b = n.replace(" (skipped)", "")
+        lines.append(f'{b}: {{label: "{b}"}}')
+    for s, t in graph.items():
+        s2 = s.replace(" (skipped)", "")
+        for x in t:
+            x2 = x.replace(" (skipped)", "")
+            lines.append(f"{s2} -> {x2}")
     return "\n".join(lines)
 
-import math
-import tkinter as tk
-
-def show_graph_tk(graph: dict):
-    """
-    Примитивная визуализация графа через Tkinter:
-    - узлы по кругу
-    - рёбра линиями
-    """
-    # Собираем узлы
+def show_graph_tk(graph):
     nodes = set(graph.keys())
-    for targets in graph.values():
-        for t in targets:
-            nodes.add(t)
-
+    for t in graph.values():
+        for x in t:
+            nodes.add(x)
     nodes = sorted(nodes)
     if not nodes:
-        print("Граф пуст, нечего рисовать.")
         return
-
-    # Позиции на окружности
     R = 200
     CX, CY = 250, 250
-    positions = {}
-    for i, node in enumerate(nodes):
-        angle = 2 * math.pi * i / len(nodes)
-        x = CX + R * math.cos(angle)
-        y = CY + R * math.sin(angle)
-        positions[node] = (x, y)
-
+    pos = {}
+    for i, n in enumerate(nodes):
+        ang = 2 * math.pi * i / len(nodes)
+        pos[n] = (CX + R * math.cos(ang), CY + R * math.sin(ang))
     root = tk.Tk()
-    root.title("Dependency graph")
-    canvas = tk.Canvas(root, width=500, height=500, bg="white")
-    canvas.pack(fill="both", expand=True)
-
-    # Рёбра
-    for src, targets in graph.items():
-        x1, y1 = positions[src]
-        for t in targets:
-            x2, y2 = positions[t]
-            canvas.create_line(x1, y1, x2, y2)
-
-    # Узлы
-    radius = 15
-    for node, (x, y) in positions.items():
-        canvas.create_oval(x - radius, y - radius, x + radius, y + radius)
-        canvas.create_text(x, y, text=node)
-
+    c = tk.Canvas(root, width=500, height=500, bg="white")
+    c.pack(fill="both", expand=True)
+    for s, tg in graph.items():
+        x1, y1 = pos[s]
+        for t in tg:
+            if t not in pos:
+                continue
+            x2, y2 = pos[t]
+            c.create_line(x1, y1, x2, y2)
+    r = 15
+    for n, (x, y) in pos.items():
+        c.create_oval(x - r, y - r, x + r, y + r)
+        c.create_text(x, y, text=n)
     root.mainloop()
 
-# ---------- CLI main ----------
-
 def main():
-    args = parse_args()
-
-    settings = {
-        "package": args.package,
-        "repo": args.repo,
-        "mode": args.mode,
-        "version": args.version,
-        "filter": args.filter,
-        "show_load_order": args.show_load_order,
-    }
-    print("Параметры:")
-    for k, v in settings.items():
-        print(f"{k}: {v}")
-    print("-" * 40)
-
-    if args.mode != "test" and ":" not in args.package:
-        print("Ошибка: для remote/local --package должен быть groupId:artifactId", file=sys.stderr)
-        sys.exit(2)
-
-    try:
-        graph, visited, cycles, load_order = build_transitive_graph(
-            args.package, args.mode, args.repo, args.version, args.filter
-        )
-    except FileNotFoundError as e:
-        print(f"Ошибка: {e}", file=sys.stderr)
-        sys.exit(3)
-    except Exception as e:
-        print(f"Непредвиденная ошибка: {e}", file=sys.stderr)
-        sys.exit(10)
-
-    print("Граф зависимостей (рёбра):")
-    if not graph:
-        print("(пустой граф)")
-    else:
-        for src, targets in graph.items():
-            for t in targets:
-                print(f"{src} -> {t}")
-    print("-" * 20)
-
-    print("Посещённые узлы:")
-    if visited:
-        for v in sorted(visited):
-            print(v)
-    else:
-        print("(нет посещённых узлов)")
-    print("-" * 20)
-
+    a = parse_args()
+    graph, visited, cycles, load = build_transitive_graph(a.package, a.mode, a.repo, a.version, a.filter)
+    print("GRAPH:")
+    for s, tg in graph.items():
+        for t in tg:
+            print(f"{s} -> {t}")
+    print("VISITED:", *sorted(visited))
     if cycles:
-        print("Обнаруженные циклы:")
+        print("CYCLES:")
         for c in cycles:
             print(" -> ".join(c))
-    else:
-        print("Циклов не обнаружено.")
-    print("-" * 20)
-
-    if args.show_load_order:
-        print("Порядок загрузки (dependencies-before-dependents):")
-        if not load_order:
-            print("(пусто)")
-        else:
-            # load_order сейчас: [dep1, dep2, ..., root] — уже в нужном порядке
-            for n in load_order:
-                print(n)
-    
-    if args.mode == "test":
-        show_graph_tk(graph)
+    if a.show_load_order:
+        print("LOAD ORDER:")
+        for n in load:
+            print(n)
+    if a.d2:
+        print("D2:")
+        print(graph_to_d2(graph))
 
 if __name__ == "__main__":
     main()
