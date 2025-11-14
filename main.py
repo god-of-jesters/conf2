@@ -34,6 +34,8 @@ def parse_args():
                    help="Подстрока для исключения пакетов из анализа (case-insensitive)")
     p.add_argument("--show-load-order", action="store_true",
                    help="Показать порядок загрузки зависимостей (постфиксный DFS)")
+    p.add_argument("--d2", action="store_true",
+               help="Вывести текстовое описание графа в формате D2")
     return p.parse_args()
 
 # ---------- POM utilities (remote/local) ----------
@@ -202,6 +204,85 @@ def build_transitive_graph(start_coord: str, mode: str, repo: str,
 
     return graph, visited, cycles, load_order
 
+def graph_to_d2(graph: dict) -> str:
+    """
+    Преобразует graph (node -> set(neighbors)) в текст D2.
+    """
+    lines = []
+    lines.append("# D2 diagram for dependency graph")
+    lines.append("direction: right")  # можно убрать, это просто пример
+
+    # Собираем все узлы (на всякий случай)
+    nodes = set(graph.keys())
+    for targets in graph.values():
+        for t in targets:
+            nodes.add(t)
+
+    # Явно объявим узлы (не обязательно, но аккуратнее)
+    for n in sorted(nodes):
+        # Чистим суффикс (skipped) если используешь его
+        base = n.replace(" (skipped)", "")
+        lines.append(f'{base}: {{ label: "{base}" }}')
+
+    # Рёбра
+    for src, targets in graph.items():
+        src_clean = src.replace(" (skipped)", "")
+        for t in targets:
+            tgt_clean = t.replace(" (skipped)", "")
+            lines.append(f"{src_clean} -> {tgt_clean}")
+
+    return "\n".join(lines)
+
+import math
+import tkinter as tk
+
+def show_graph_tk(graph: dict):
+    """
+    Примитивная визуализация графа через Tkinter:
+    - узлы по кругу
+    - рёбра линиями
+    """
+    # Собираем узлы
+    nodes = set(graph.keys())
+    for targets in graph.values():
+        for t in targets:
+            nodes.add(t)
+
+    nodes = sorted(nodes)
+    if not nodes:
+        print("Граф пуст, нечего рисовать.")
+        return
+
+    # Позиции на окружности
+    R = 200
+    CX, CY = 250, 250
+    positions = {}
+    for i, node in enumerate(nodes):
+        angle = 2 * math.pi * i / len(nodes)
+        x = CX + R * math.cos(angle)
+        y = CY + R * math.sin(angle)
+        positions[node] = (x, y)
+
+    root = tk.Tk()
+    root.title("Dependency graph")
+    canvas = tk.Canvas(root, width=500, height=500, bg="white")
+    canvas.pack(fill="both", expand=True)
+
+    # Рёбра
+    for src, targets in graph.items():
+        x1, y1 = positions[src]
+        for t in targets:
+            x2, y2 = positions[t]
+            canvas.create_line(x1, y1, x2, y2)
+
+    # Узлы
+    radius = 15
+    for node, (x, y) in positions.items():
+        canvas.create_oval(x - radius, y - radius, x + radius, y + radius)
+        canvas.create_text(x, y, text=node)
+
+    root.mainloop()
+
 # ---------- CLI main ----------
 
 def main():
@@ -268,6 +349,9 @@ def main():
             # load_order сейчас: [dep1, dep2, ..., root] — уже в нужном порядке
             for n in load_order:
                 print(n)
+    
+    if args.mode == "test":
+        show_graph_tk(graph)
 
 if __name__ == "__main__":
     main()
