@@ -1,0 +1,5 @@
+configur:
+    version: 2.0
+    dependents:
+        Werkzeug: 3.0
+        Jinja2: 3.1

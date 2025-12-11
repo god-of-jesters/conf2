@@ -1,0 +1,4 @@
+configur:
+    version: 3.0
+    dependents:
+        MarkupSafe: 2.1

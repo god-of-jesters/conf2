@@ -1,0 +1,5 @@
+configur:
+    version: 2.31
+    dependents:
+        urllib3: 2.0
+        charset-normalizer: 3.3

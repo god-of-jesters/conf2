@@ -1,0 +1,5 @@
+configur:
+    version: 1.0.0
+    dependents:
+        Flask: 2.0
+        requests: 2.31
