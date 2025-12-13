@@ -1,8 +1,11 @@
 import argparse
 from pathlib import Path
+import math
 
 import requests
 from bs4 import BeautifulSoup
+import tkinter as tk
+from tkinter import TclError
 
 
 def parse_args():
@@ -43,7 +46,7 @@ def parse_dependencies_from_txt(txt: str):
             python 3.12
             Flask: 2.12
             bs4: 4.21
-    -> ['python', 'Flask', 'bs4']
+    -> ['python', 'Flask', 'bs4']  (упрощённый вариант)
     """
     deps = []
     lines = txt.splitlines()
@@ -58,15 +61,21 @@ def parse_dependencies_from_txt(txt: str):
             continue
 
         if in_deps:
-            l = line.split(':')
-            deps.append(l[0].strip())
+            line = line.strip()
+            if not line:
+                continue
+            # берём всё до ':' как имя зависимости
+            parts = line.split(":", 1)
+            name = parts[0].strip()
+            if name:
+                deps.append(name)
+
     return deps
 
 
 def parse_dependencies_from_html(html_text: str):
     """
     Парсер для страниц репозитория Alpine (секция 'Depends').
-    При необходимости адаптируй под свой формат.
     """
     soup = BeautifulSoup(html_text, "html.parser")
     dependencies = []
@@ -93,6 +102,8 @@ def parse_dependencies_from_html(html_text: str):
     return dependencies
 
 
+# ======================= GRAPH BUILDERS =======================
+
 def build_graph_from_txt_dir(dir_path: str) -> dict[str, set[str]]:
     """
     test-режим: берём все *.txt из директории и строим граф:
@@ -110,6 +121,7 @@ def build_graph_from_txt_dir(dir_path: str) -> dict[str, set[str]]:
         deps = parse_dependencies_from_txt(text)
         graph[pkg_name] = set(deps)
 
+    # добавляем вершины для всех зависимостей
     for deps in list(graph.values()):
         for dep in deps:
             graph.setdefault(dep, set())
@@ -129,10 +141,10 @@ def fetch_remote_deps(base_url: str, package: str) -> list[str]:
     return parse_dependencies_from_html(resp.text)
 
 
-def build_graph_remote(root: str, base_url: str) -> dict[str, set[str]]:
+def build_graph_remote(root_pkg: str, base_url: str) -> dict[str, set[str]]:
     graph: dict[str, set[str]] = {}
     visited: set[str] = set()
-    stack: list[str] = [root]
+    stack: list[str] = [root_pkg]
 
     while stack:
         pkg = stack.pop()
@@ -159,18 +171,20 @@ def build_graph_remote(root: str, base_url: str) -> dict[str, set[str]]:
     return graph
 
 
-def compute_load_order(graph: dict[str, set[str]], root: str):
+# ======================= LOAD ORDER (DFS) =======================
+
+def compute_load_order(graph: dict[str, set[str]], root_pkg: str):
     WHITE, GRAY, BLACK = 0, 1, 2
     color: dict[str, int] = {node: WHITE for node in graph}
     order: list[str] = []
     cycles: list[tuple[str, str]] = []
 
-    if root not in color:
+    if root_pkg not in color:
         return order, cycles
 
     stack: list[tuple[str, object]] = []
-    color[root] = GRAY
-    stack.append((root, iter(graph.get(root, []))))
+    color[root_pkg] = GRAY
+    stack.append((root_pkg, iter(graph.get(root_pkg, []))))
 
     while stack:
         node, it = stack[-1]
@@ -193,6 +207,65 @@ def compute_load_order(graph: dict[str, set[str]], root: str):
     order.reverse()
     return order, cycles
 
+
+def show_graph_tk(graph: dict[str, set[str]], root_pkg: str):
+    """
+    Простая визуализация графа в Tkinter:
+    - вершины по окружности,
+    - рёбра линиями со стрелками.
+
+    Если Tkinter не может создать окно (headless / нет Tcl/Tk),
+    просто пишем в stdout и выходим.
+    """
+
+    win = tk.Tk()
+
+    nodes = list(graph.keys())
+    n = len(nodes)
+
+    width, height = 800, 600
+    cx, cy = width // 2, height // 2
+    radius = min(width, height) // 2 - 60
+    if radius < 50:
+        radius = 50
+
+    # координаты вершин по окружности
+    positions: dict[str, tuple[float, float]] = {}
+    for i, name in enumerate(nodes):
+        angle = 2 * math.pi * i / max(n, 1)
+        x = cx + radius * math.cos(angle)
+        y = cy + radius * math.sin(angle)
+        positions[name] = (x, y)
+
+    win.title("Dependency Graph")
+
+    canvas = tk.Canvas(win, width=width, height=height, bg="white")
+    canvas.pack(fill=tk.BOTH, expand=True)
+
+    # рёбра
+    for src, targets in graph.items():
+        x1, y1 = positions[src]
+        for dst in targets:
+            if dst not in positions:
+                continue
+            x2, y2 = positions[dst]
+            canvas.create_line(x1, y1, x2, y2, arrow=tk.LAST)
+
+    # вершины
+    node_radius = 20
+    for name, (x, y) in positions.items():
+        fill = "lightgreen" if name == root_pkg else "lightblue"
+        canvas.create_oval(
+            x - node_radius, y - node_radius,
+            x + node_radius, y + node_radius,
+            fill=fill, outline="black"
+        )
+        canvas.create_text(x, y, text=name)
+
+    win.mainloop()
+
+
+# ======================= MAIN =======================
 
 def main():
     args = parse_args()
@@ -222,6 +295,14 @@ def main():
             print(f"- {u} -> {v}")
     else:
         print("- none")
+
+    # попытка показать граф в Tkinter (не критично, если не получится)
+    show_graph_tk(graph, args.package)
+
+
+if __name__ == "__main__":
+    main()
+
 
 
 if __name__ == "__main__":
